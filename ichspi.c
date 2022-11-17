@@ -1439,7 +1439,8 @@ static int ich_hwseq_wait_for_cycle_complete(unsigned int len, enum ich_chipset 
 static void ich_start_hwseq_xfer(uint32_t hsfc_cycle, uint32_t flash_addr, size_t len,
 		uint32_t addr_mask)
 {
-	uint16_t hsfc;
+	/* make sure HSFC register is cleared before initiate any operation */
+	uint16_t hsfc = 0;
 
 	/* Sets flash_addr in FADDR */
 	ich_hwseq_set_addr(flash_addr, addr_mask);
@@ -1448,8 +1449,6 @@ static void ich_start_hwseq_xfer(uint32_t hsfc_cycle, uint32_t flash_addr, size_
 	REGWRITE16(ICH9_REG_HSFS, REGREAD16(ICH9_REG_HSFS));
 
 	/* Set up transaction parameters. */
-	hsfc = REGREAD16(ICH9_REG_HSFC);
-	hsfc &= ~g_hwseq_data.hsfc_fcycle; /* clear operation */
 	hsfc |= hsfc_cycle;
 	hsfc |= HSFC_FDBC_VAL(len - 1);
 	hsfc |= HSFC_FGO; /* start */
