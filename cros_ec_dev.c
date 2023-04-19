@@ -438,6 +438,9 @@ static int cros_ec_parse_param(struct cros_ec_priv *priv)
 			return 1;
 		}
 		priv->dev = ec_type[index];
+		if (!strcmp(priv->dev, "fp"))
+			msg_perr("\t\033[31;1;5;7m >> The fp subtype is deprecated! Remove call site NOW as this WILL be deleted! <<\033[0m\n");
+		priv->subtype = index;
 		msg_pdbg("Target %s used\n", priv->dev);
 	}
 	free(p);
@@ -523,6 +526,7 @@ static struct cros_ec_priv cros_ec_dev_priv = {
 	.detected	= 0,
 	.ec_command	= cros_ec_command_dev,
 	.dev = "ec",
+	.subtype = 0
 };
 
 static struct opaque_master opaque_master_cros_ec_dev = {
