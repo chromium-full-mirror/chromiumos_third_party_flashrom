@@ -259,7 +259,7 @@ int usb_device_find(struct usb_match const *match, struct usb_device **devices)
  *     0: The device was already open or was successfully opened.
  *     non-zero: There was a failure while opening the device.
  */
-static int usb_device_open(struct usb_device *device)
+int usb_device_open(struct usb_device *device)
 {
 	if (device->handle == NULL) {
 		int ret = LIBUSB(libusb_open(device->device, &device->handle));
@@ -359,6 +359,7 @@ int usb_device_claim(struct usb_device *device)
 				device->interface_descriptor->bInterfaceNumber);
 		return ret;
 	}
+	device->claimed = true;
 
 	if (device->interface_descriptor->bAlternateSetting != 0) {
 		ret = LIBUSB(libusb_set_interface_alt_setting(
@@ -389,17 +390,20 @@ struct usb_device *usb_device_free(struct usb_device *device)
 	next = device->next;
 
 	if (device->handle != NULL) {
-		libusb_release_interface(device->handle,
-			device->interface_descriptor->bInterfaceNumber);
-
-		/*
-		 * Vendor-specific interfaces generally do not have standard kernel
-		 * drivers attached. Attempting to re-attach drivers to them during
-		 * cleanup can cause potential kernel hangs.
-		 */
-		if (device->interface_descriptor->bInterfaceClass != LIBUSB_CLASS_VENDOR_SPEC) {
-			libusb_attach_kernel_driver(device->handle,
+		if (device->claimed) {
+			libusb_release_interface(device->handle,
 				device->interface_descriptor->bInterfaceNumber);
+
+			/*
+			 * Vendor-specific interfaces generally do not have standard kernel
+			 * drivers attached. Attempting to re-attach drivers to them during
+			 * cleanup can cause potential kernel hangs.
+			 */
+			if (device->interface_descriptor->bInterfaceClass != LIBUSB_CLASS_VENDOR_SPEC) {
+				libusb_attach_kernel_driver(device->handle,
+					device->interface_descriptor->bInterfaceNumber);
+			}
+			device->claimed = false;
 		}
 
 		libusb_close(device->handle);

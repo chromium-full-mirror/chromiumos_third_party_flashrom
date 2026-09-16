@@ -1590,23 +1590,12 @@ static int raiden_debug_spi_init(const struct programmer_cfg *cfg)
 			goto loop_end;
 		}
 
-		ret = usb_device_claim(device);
-		if (ret) {
-			msg_pdbg("Raiden: Failed to claim USB device");
-			usb_device_show(" ", current);
-			if (usb_device_is_libusb_error(ret) &&
-			    ret == LIBUSB_ERROR(LIBUSB_ERROR_BUSY) &&
-			    device->handle != NULL) {
-				msg_perr("Raiden: Device is busy, attempting to reset...\n");
-				libusb_reset_device(device->handle);
-			}
+		if (usb_device_open(device)) {
+			msg_pdbg("Raiden: Failed to open USB device\n");
 			goto loop_end;
 		}
 
-		if (!serial) {
-			found = true;
-			goto loop_end;
-		} else {
+		if (serial) {
 			unsigned char dev_serial[32] = { 0 };
 			struct libusb_device_descriptor descriptor;
 			int rc;
@@ -1622,17 +1611,49 @@ static int raiden_debug_spi_init(const struct programmer_cfg *cfg)
 					sizeof(dev_serial));
 			if (rc < 0) {
 				LIBUSB(rc);
-			} else {
-				if (strcmp(serial, (char *)dev_serial)) {
-					msg_pdbg("Raiden: Serial number %s did not match device", serial);
-					usb_device_show(" ", current);
-				} else {
-					msg_pinfo("Raiden: Serial number %s matched device", serial);
-					usb_device_show(" ", current);
-					found = true;
-				}
+				/*
+				 * This bails out before usb_device_claim(), so the
+				 * LIBUSB_ERROR_BUSY recovery reset below is
+				 * unreachable here. That is acceptable: BUSY is a
+				 * host-side condition (another fd holds the
+				 * interface), independent of EP0 health. And once
+				 * the serial is unreadable the device is
+				 * unidentified, so we could not reset it safely
+				 * anyway.
+				 */
+				goto loop_end;
 			}
+
+			if (strcmp(serial, (char *)dev_serial)) {
+				msg_pdbg("Raiden: Serial number %s did not match device", serial);
+				usb_device_show(" ", current);
+				goto loop_end;
+			}
+			msg_pinfo("Raiden: Serial number %s matched device", serial);
+			usb_device_show(" ", current);
+		} else {
+			msg_pwarn("Raiden: No serial number specified; targeting first matched device.\n");
 		}
+
+		ret = usb_device_claim(device);
+		if (ret) {
+			msg_pdbg("Raiden: Failed to claim USB device");
+			usb_device_show(" ", current);
+			if (usb_device_is_libusb_error(ret) &&
+			    ret == LIBUSB_ERROR(LIBUSB_ERROR_BUSY) &&
+			    device->handle != NULL) {
+				if (!serial) {
+					msg_pwarn("Raiden: Resetting busy device without serial number specified. "
+					          "In multi-debugger setups, this may disrupt other devices. "
+					          "Specify 'serial=<serial>' to target a specific device.\n");
+				}
+				msg_perr("Raiden: Device is busy, attempting to reset...\n");
+				libusb_reset_device(device->handle);
+			}
+			goto loop_end;
+		}
+
+		found = true;
 
 loop_end:
 		if (found)

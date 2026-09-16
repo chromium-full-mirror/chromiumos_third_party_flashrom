@@ -124,10 +124,11 @@ struct usb_device {
 
 	/*
 	 * Initially NULL, the libusb_device_handle is only valid once the
-	 * usb_device has been successfully passed to usb_device_show or
-	 * usb_device_claim.
+	 * usb_device has been successfully passed to usb_device_open,
+	 * usb_device_show or usb_device_claim.
 	 */
 	struct libusb_device_handle *handle;
+	bool claimed;
 
 	/*
 	 * Link to next device, or NULL
@@ -146,6 +147,16 @@ struct usb_device {
  *     1: No matching devices were found.
  */
 int usb_device_find(struct usb_match const *match, struct usb_device **devices);
+
+/*
+ * Open the underlying libusb device handle if it is not already open.
+ * Does not claim any USB interface.
+ *
+ * Return:
+ *     0: The device handle is open.
+ *     non-zero: Failed to open device handle.
+ */
+int usb_device_open(struct usb_device *device);
 
 /*
  * Display the devices bus and address as well as its product string.  The
