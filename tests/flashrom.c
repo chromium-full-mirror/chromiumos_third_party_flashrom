@@ -69,3 +69,38 @@ void flashbuses_to_text_test_success(void **state)
 	text = flashbuses_to_text(bustype);
 	assert_equal_and_free(text, "None");
 }
+
+void flash_reg_names_test_success(void **state)
+{
+	(void) state; /* unused */
+
+	/* Every register has a name and every name maps back to the register. */
+	for (enum flash_reg reg = INVALID_REG + 1; reg < MAX_REGISTERS; reg++) {
+		const char *name = flash_reg_to_name(reg);
+
+		assert_string_not_equal(name, "UNKNOWN");
+		assert_int_equal(flash_reg_from_name(name), reg);
+	}
+
+	assert_string_equal(flash_reg_to_name(STATUS1), "STATUS1");
+	assert_string_equal(flash_reg_to_name(SECURITY), "SECURITY");
+	assert_string_equal(flash_reg_to_name(CONFIG), "CONFIG");
+
+	/* Out of range values must not read out of bounds. */
+	assert_string_equal(flash_reg_to_name(INVALID_REG), "UNKNOWN");
+	assert_string_equal(flash_reg_to_name(MAX_REGISTERS), "UNKNOWN");
+	assert_string_equal(flash_reg_to_name(-1), "UNKNOWN");
+
+	/* Lookup is case-insensitive and accepts the SRx short names. */
+	assert_int_equal(flash_reg_from_name("status2"), STATUS2);
+	assert_int_equal(flash_reg_from_name("Config"), CONFIG);
+	assert_int_equal(flash_reg_from_name("SR1"), STATUS1);
+	assert_int_equal(flash_reg_from_name("sr3"), STATUS3);
+
+	assert_int_equal(flash_reg_from_name(NULL), INVALID_REG);
+	assert_int_equal(flash_reg_from_name(""), INVALID_REG);
+	assert_int_equal(flash_reg_from_name("SR"), INVALID_REG);
+	assert_int_equal(flash_reg_from_name("SR4"), INVALID_REG);
+	assert_int_equal(flash_reg_from_name("STATUS"), INVALID_REG);
+	assert_int_equal(flash_reg_from_name("ALL"), INVALID_REG);
+}

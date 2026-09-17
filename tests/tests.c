@@ -447,6 +447,7 @@ int main(int argc, char *argv[])
 
 	const struct CMUnitTest flashrom_tests[] = {
 		cmocka_unit_test(flashbuses_to_text_test_success),
+		cmocka_unit_test(flash_reg_names_test_success),
 	};
 	ret |= cmocka_run_group_tests_name("flashrom.c tests", flashrom_tests, NULL, NULL);
 

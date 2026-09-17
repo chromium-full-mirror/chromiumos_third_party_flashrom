@@ -201,6 +201,12 @@ struct flashrom_flashctx;
 #define flashctx flashrom_flashctx /* TODO: Agree on a name and convert all occurrences. */
 typedef int (erasefunc_t)(struct flashctx *flash, unsigned int addr, unsigned int blocklen);
 
+/*
+ * Only the first and last entries are positional: INVALID_REG must stay 0 and
+ * MAX_REGISTERS must stay last. Code iterates over the valid registers as
+ * [INVALID_REG + 1, MAX_REGISTERS), so new registers may be added anywhere in
+ * between.
+ */
 enum flash_reg {
 	INVALID_REG = 0,
 	STATUS1,
@@ -210,6 +216,15 @@ enum flash_reg {
 	CONFIG,
 	MAX_REGISTERS
 };
+
+/* Canonical name of a register, e.g. "STATUS1". Never returns NULL. */
+const char *flash_reg_to_name(enum flash_reg reg);
+/*
+ * Look up a register by its canonical name (case-insensitive). The short forms
+ * "SR1", "SR2" and "SR3" are accepted as aliases of the STATUSx registers.
+ * Returns INVALID_REG if the name is not known.
+ */
+enum flash_reg flash_reg_from_name(const char *name);
 
 struct reg_bit_info {
 	/* Register containing the bit */

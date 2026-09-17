@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -264,6 +265,60 @@ int programmer_shutdown(void)
 	}
 
 	return ret;
+}
+
+/*
+ * Canonical names of the chip registers that flashrom knows about. Keep this
+ * in sync with enum flash_reg.
+ */
+static const char *const flash_reg_names[] = {
+	[INVALID_REG]	= "INVALID",
+	[STATUS1]	= "STATUS1",
+	[STATUS2]	= "STATUS2",
+	[STATUS3]	= "STATUS3",
+	[SECURITY]	= "SECURITY",
+	[CONFIG]	= "CONFIG",
+};
+
+/*
+ * Adding a register at the end of enum flash_reg without adding its name above
+ * would make flash_reg_to_name() read out of bounds, so fail the build
+ * instead. This is spelled out by hand because the project is built as C99,
+ * which has no _Static_assert.
+ *
+ * Note that this cannot catch a register inserted in the middle of the enum:
+ * that keeps the array size correct but leaves a NULL hole, so the lookups
+ * below have to tolerate NULL entries as well.
+ */
+typedef char flash_reg_names_is_complete[
+	(ARRAY_SIZE(flash_reg_names) == MAX_REGISTERS) ? 1 : -1];
+
+const char *flash_reg_to_name(enum flash_reg reg)
+{
+	if (reg <= INVALID_REG || reg >= MAX_REGISTERS || !flash_reg_names[reg])
+		return "UNKNOWN";
+
+	return flash_reg_names[reg];
+}
+
+enum flash_reg flash_reg_from_name(const char *name)
+{
+	if (!name)
+		return INVALID_REG;
+
+	for (enum flash_reg reg = INVALID_REG + 1; reg < MAX_REGISTERS; reg++) {
+		if (flash_reg_names[reg] && !strcasecmp(name, flash_reg_names[reg]))
+			return reg;
+	}
+
+	/* Also accept the short names commonly used in datasheets. */
+	if (strlen(name) == 3 && !strncasecmp(name, "SR", 2) &&
+	    name[2] >= '1' && name[2] <= '3') {
+		static const enum flash_reg sr_alias[] = { STATUS1, STATUS2, STATUS3 };
+		return sr_alias[name[2] - '1'];
+	}
+
+	return INVALID_REG;
 }
 
 void *master_map_flash_region(const struct registered_master *mst,

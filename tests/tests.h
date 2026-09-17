@@ -29,6 +29,7 @@ void reverse_bytes_test_success(void **state);
 
 /* flashrom.c */
 void flashbuses_to_text_test_success(void **state);
+void flash_reg_names_test_success(void **state);
 
 /* spi25.c */
 void spi_write_enable_test_success(void **state);
