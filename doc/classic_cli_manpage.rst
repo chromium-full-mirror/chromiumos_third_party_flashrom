@@ -19,6 +19,7 @@ SYNOPSIS
 |               [-i <include>[:<file>]]]
 |             [--wp-status] [--wp-list] [--wp-enable|--wp-disable]
 |             [--wp-range <start>,<length>|--wp-region <region>]
+|             [--read-register <register>]
 |             [-n] [-N] [-f])]
 |         [-V[V[V]]] [-o <logfile>] [--progress]
 
@@ -229,6 +230,18 @@ All operations involving any chip access (probe/read/write/...) require the ``-p
         Same as ``--wp-range`` but protects the range occupied by an image region.
         This option requires a image layout to be specified, see ``--layout``.
         The region must be supported by the flash, see ``--wp-list``.
+
+
+**--read-register <register>**
+        Prints the value of a chip register in hexadecimal.
+        **<register>** is one of **STATUS1**, **STATUS2**, **STATUS3**, **SECURITY** and **CONFIG**
+        (the short names **SR1**, **SR2** and **SR3** are accepted as well), or **ALL** to print every
+        register the chip implements.
+
+        Which registers exist depends on the chip: Winbond and GigaDevice style chips typically
+        implement **STATUS1** to **STATUS3**, while Macronix style chips implement **CONFIG** and
+        **SECURITY** instead of **STATUS2**/**STATUS3**. Requesting a register the chip does not
+        implement is an error, while ``ALL`` silently skips those registers.
 
 
 **--flash-name**

@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <string.h>
+#include <strings.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -33,6 +34,8 @@
 #include "programmer.h"
 
 #include "libflashrom.h"
+#include "chipdrivers.h"
+#include "spi.h"
 
 enum {
 	OPTION_IFD = 0x0100,
@@ -41,6 +44,7 @@ enum {
 	OPTION_FLASH_CONTENTS,
 	OPTION_FLASH_NAME,
 	OPTION_FLASH_SIZE,
+	OPTION_READ_REGISTER,
 	OPTION_WP_STATUS,
 	OPTION_WP_SET_RANGE,
 	OPTION_WP_SET_REGION,
@@ -77,6 +81,13 @@ struct cli_options {
 	char *logfile;
 	char *referencefile;
 	const char *chip_to_probe;
+
+	bool read_register;
+	/*
+	 * Register selected by --read-register. MAX_REGISTERS means "all
+	 * registers".
+	 */
+	enum flash_reg reg;
 };
 
 static void cli_classic_usage(const char *name)
@@ -112,6 +123,10 @@ static void cli_classic_usage(const char *name)
 	       "      --wp-range=<start>,<len>      set write protection range (use --wp-range=0,0\n"
 	       "                                    to unprotect the entire flash)\n"
 	       "      --wp-region <region>          set write protection region\n"
+	       "      --read-register <register>    print a chip register in hex. <register> is one\n"
+	       "                                    of STATUS1, STATUS2, STATUS3, SECURITY, CONFIG\n"
+	       "                                    (SR1, SR2, SR3 are accepted as aliases), or ALL\n"
+	       "                                    for every register the chip implements\n"
 	       "      --flash-name                  read out the detected flash name\n"
 	       "      --flash-size                  read out the detected flash size\n"
 	       "      --fmap                        read ROM layout from fmap embedded in ROM\n"
@@ -248,6 +263,132 @@ static const char *get_wp_error_str(int err)
 	}
 	return "unknown WP error";
 }
+
+/*
+ * Parse a --read-register argument. In addition to the register names known
+ * to flash_reg_from_name(), "ALL" is accepted (and returned as MAX_REGISTERS).
+ */
+static enum flash_reg parse_register_name(const char *name)
+{
+	if (!strcasecmp(name, "ALL"))
+		return MAX_REGISTERS;
+
+	return flash_reg_from_name(name);
+}
+
+static void print_supported_register_names(bool allow_all)
+{
+	msg_gerr("Valid register names are:");
+	for (enum flash_reg reg = INVALID_REG + 1; reg < MAX_REGISTERS; reg++)
+		msg_gerr(" %s", flash_reg_to_name(reg));
+	if (allow_all)
+		msg_gerr(" ALL");
+	msg_gerr("\n");
+}
+
+/*
+ * Register access is either provided by an opaque master (which owns the whole
+ * chip interface, e.g. Intel hwseq) or performed as plain SPI commands.
+ */
+static bool register_op_available(const struct flashctx *flash)
+{
+	if (flash->mst->buses_supported & BUS_PROG)
+		return flash->mst->opaque.read_register != NULL;
+
+	return (flash->mst->buses_supported & BUS_SPI) != 0;
+}
+
+/*
+ * Whether the chip is known to implement the register. Opaque masters do not
+ * necessarily use the chip's feature bits, so give them the benefit of the
+ * doubt and let the master report the error instead.
+ */
+static bool register_supported_by_chip(const struct flashctx *flash, enum flash_reg reg)
+{
+	if (flash->mst->buses_supported & BUS_PROG)
+		return true;
+
+	return spi_register_readable(flash, reg);
+}
+
+/*
+ * The helper below must not be called without checking
+ * register_op_available() first, but guard the function pointer anyway.
+ */
+static int read_register(struct flashctx *flash, enum flash_reg reg, uint8_t *value)
+{
+	if (flash->mst->buses_supported & BUS_PROG) {
+		if (!flash->mst->opaque.read_register)
+			return SPI_INVALID_OPCODE;
+		return flash->mst->opaque.read_register(flash, reg, value);
+	}
+
+	return spi_read_register(flash, reg, value);
+}
+
+
+/* Print a single register, or all registers the chip implements if reg is MAX_REGISTERS. */
+static int read_register_cli(struct flashctx *flash, enum flash_reg reg)
+{
+	const bool read_all = (reg == MAX_REGISTERS);
+	bool printed_any = false;
+
+	if (!register_op_available(flash)) {
+		msg_gerr("Error: Reading registers is not supported by the programmer.\n");
+		return 1;
+	}
+
+	for (enum flash_reg r = INVALID_REG + 1; r < MAX_REGISTERS; r++) {
+		uint8_t value;
+
+		if (!read_all && r != reg)
+			continue;
+
+		/*
+		 * Which registers exist is highly vendor specific, e.g. Winbond
+		 * chips have STATUS2/STATUS3 while Macronix chips have CONFIG
+		 * and SECURITY instead. Only registers the chip actually
+		 * implements are printed for ALL.
+		 */
+		if (!register_supported_by_chip(flash, r)) {
+			if (read_all) {
+				msg_pdbg("Register %s is not implemented by this chip, skipping.\n",
+					 flash_reg_to_name(r));
+				continue;
+			}
+			msg_gerr("Error: Register %s is not implemented by chip \"%s\".\n",
+				 flash_reg_to_name(r), flash->chip->name);
+			return 1;
+		}
+
+		int rc = read_register(flash, r, &value);
+		if (rc == SPI_INVALID_OPCODE) {
+			if (read_all) {
+				msg_pdbg("Reading register %s is not supported by the programmer, "
+					 "skipping.\n", flash_reg_to_name(r));
+				continue;
+			}
+			msg_gerr("Error: Reading register %s is not supported by the programmer.\n",
+				 flash_reg_to_name(r));
+			return 1;
+		}
+		if (rc) {
+			msg_gerr("Error: Failed to read register %s.\n", flash_reg_to_name(r));
+			return 1;
+		}
+
+		msg_ginfo("Register %s: 0x%02x\n", flash_reg_to_name(r), value);
+		printed_any = true;
+	}
+
+	if (!printed_any) {
+		msg_gerr("Error: No register could be read from chip \"%s\".\n", flash->chip->name);
+		return 1;
+	}
+
+	return 0;
+}
+
 
 static int wp_cli(
 		struct flashctx *flash,
@@ -767,6 +908,16 @@ static void parse_options(int argc, char **argv, const char *optstring,
 			cli_classic_validate_singleop(&operation_specified);
 			options->flash_size = true;
 			break;
+		case OPTION_READ_REGISTER:
+			cli_classic_validate_singleop(&operation_specified);
+			options->read_register = true;
+			options->reg = parse_register_name(optarg);
+			if (options->reg == INVALID_REG) {
+				msg_gerr("Error: Invalid register name \"%s\".\n", optarg);
+				print_supported_register_names(true);
+				cli_classic_abort_usage(NULL);
+			}
+			break;
 		case OPTION_WP_STATUS:
 			options->print_wp_status = true;
 			break;
@@ -921,6 +1072,7 @@ int main(int argc, char *argv[])
 		{"flash-name",		0, NULL, OPTION_FLASH_NAME},
 		{"flash-size",		0, NULL, OPTION_FLASH_SIZE},
 		{"get-size",		0, NULL, OPTION_FLASH_SIZE}, // (deprecated): back compatibility.
+		{"read-register",	1, NULL, OPTION_READ_REGISTER},
 		{"wp-status",		0, NULL, OPTION_WP_STATUS},
 		{"wp-list",		0, NULL, OPTION_WP_LIST},
 		{"wp-range",		1, NULL, OPTION_WP_SET_RANGE},
@@ -1154,7 +1306,7 @@ int main(int argc, char *argv[])
 
 	const bool any_op = options.read_it || options.write_it || options.verify_it ||
 		options.erase_it || options.flash_name || options.flash_size ||
-		options.extract_it || any_wp_op;
+		options.extract_it || options.read_register || any_wp_op;
 
 	if (!any_op) {
 		msg_ginfo("No operations were specified.\n");
@@ -1259,6 +1411,12 @@ int main(int argc, char *argv[])
 		goto out_shutdown;
 	}
 	flashrom_layout_set(fill_flash, options.layout);
+
+	if (options.read_register) {
+		ret = read_register_cli(fill_flash, options.reg);
+		if (ret)
+			goto out_release;
+	}
 
 	if (any_wp_op) {
 		if (options.set_wp_region && options.wp_region) {
