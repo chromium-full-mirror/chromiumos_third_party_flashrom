@@ -19,7 +19,7 @@ SYNOPSIS
 |               [-i <include>[:<file>]]]
 |             [--wp-status] [--wp-list] [--wp-enable|--wp-disable]
 |             [--wp-range <start>,<length>|--wp-region <region>]
-|             [--read-register <register>]
+|             [--read-register <register>|--write-register <register>=<value>]
 |             [-n] [-N] [-f])]
 |         [-V[V[V]]] [-o <logfile>] [--progress]
 
@@ -242,6 +242,31 @@ All operations involving any chip access (probe/read/write/...) require the ``-p
         implement **STATUS1** to **STATUS3**, while Macronix style chips implement **CONFIG** and
         **SECURITY** instead of **STATUS2**/**STATUS3**. Requesting a register the chip does not
         implement is an error, while ``ALL`` silently skips those registers.
+
+
+**--write-register <register>=<value>**
+        Writes the hexadecimal byte **<value>** (with or without a ``0x`` prefix) to **<register>**,
+        see ``--read-register`` for the accepted register names (**ALL** is not accepted). The
+        register is read back afterwards and a warning is printed if the value read back
+        differs, which is expected for reserved, volatile or one-time programmable bits.
+
+        Because this operation can permanently lock the chip, it additionally requires ``--force``.
+
+        This is a debugging aid, e.g. to adjust the output driver strength bits found in
+        **STATUS3** of many Winbond chips. Note that the **SECURITY** register cannot be written
+        this way, as its bits are one-time programmable and set by dedicated commands.
+
+        .. warning::
+                Writing status registers directly bypasses all of flashrom's write protection
+                logic. It is possible to permanently lock a chip this way, for example by setting
+                a one-time programmable lock bit. Use ``--wp-*`` for regular write protection
+                handling.
+
+        .. warning::
+                This is not a read-modify-write operation: the whole register byte is replaced,
+                so every bit that is not set in **<value>** is cleared. For example writing
+                ``STATUS3=0x60`` on a Winbond chip also clears **WPS** (bit 2 of status register
+                3). Read the register first and merge the bits yourself if that is not intended.
 
 
 **--flash-name**

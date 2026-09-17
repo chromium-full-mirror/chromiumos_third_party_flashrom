@@ -45,6 +45,7 @@ enum {
 	OPTION_FLASH_NAME,
 	OPTION_FLASH_SIZE,
 	OPTION_READ_REGISTER,
+	OPTION_WRITE_REGISTER,
 	OPTION_WP_STATUS,
 	OPTION_WP_SET_RANGE,
 	OPTION_WP_SET_REGION,
@@ -83,11 +84,13 @@ struct cli_options {
 	const char *chip_to_probe;
 
 	bool read_register;
+	bool write_register;
 	/*
-	 * Register selected by --read-register. MAX_REGISTERS means "all
-	 * registers".
+	 * Register selected by --read-register/--write-register. MAX_REGISTERS
+	 * means "all registers" and is only valid for reading.
 	 */
 	enum flash_reg reg;
+	uint8_t reg_value;	/* Value for --write-register. */
 };
 
 static void cli_classic_usage(const char *name)
@@ -127,6 +130,10 @@ static void cli_classic_usage(const char *name)
 	       "                                    of STATUS1, STATUS2, STATUS3, SECURITY, CONFIG\n"
 	       "                                    (SR1, SR2, SR3 are accepted as aliases), or ALL\n"
 	       "                                    for every register the chip implements\n"
+	       "      --write-register <register>=<value>\n"
+	       "                                    write hexadecimal <value> to a chip register,\n"
+	       "                                    requires -f/--force. <register> is as for\n"
+	       "                                    --read-register, except that ALL is not accepted\n"
 	       "      --flash-name                  read out the detected flash name\n"
 	       "      --flash-size                  read out the detected flash size\n"
 	       "      --fmap                        read ROM layout from fmap embedded in ROM\n"
@@ -265,12 +272,13 @@ static const char *get_wp_error_str(int err)
 }
 
 /*
- * Parse a --read-register argument. In addition to the register names known
- * to flash_reg_from_name(), "ALL" is accepted (and returned as MAX_REGISTERS).
+ * Parse a --read-register/--write-register argument. In addition to the
+ * register names known to flash_reg_from_name(), "ALL" is accepted (and
+ * returned as MAX_REGISTERS) if allow_all is set.
  */
-static enum flash_reg parse_register_name(const char *name)
+static enum flash_reg parse_register_name(const char *name, bool allow_all)
 {
-	if (!strcasecmp(name, "ALL"))
+	if (allow_all && !strcasecmp(name, "ALL"))
 		return MAX_REGISTERS;
 
 	return flash_reg_from_name(name);
@@ -290,10 +298,11 @@ static void print_supported_register_names(bool allow_all)
  * Register access is either provided by an opaque master (which owns the whole
  * chip interface, e.g. Intel hwseq) or performed as plain SPI commands.
  */
-static bool register_op_available(const struct flashctx *flash)
+static bool register_op_available(const struct flashctx *flash, bool write)
 {
 	if (flash->mst->buses_supported & BUS_PROG)
-		return flash->mst->opaque.read_register != NULL;
+		return write ? flash->mst->opaque.write_register != NULL
+			     : flash->mst->opaque.read_register != NULL;
 
 	return (flash->mst->buses_supported & BUS_SPI) != 0;
 }
@@ -303,17 +312,18 @@ static bool register_op_available(const struct flashctx *flash)
  * necessarily use the chip's feature bits, so give them the benefit of the
  * doubt and let the master report the error instead.
  */
-static bool register_supported_by_chip(const struct flashctx *flash, enum flash_reg reg)
+static bool register_supported_by_chip(const struct flashctx *flash, enum flash_reg reg, bool write)
 {
 	if (flash->mst->buses_supported & BUS_PROG)
 		return true;
 
-	return spi_register_readable(flash, reg);
+	return write ? spi_register_writable(flash, reg) : spi_register_readable(flash, reg);
 }
 
 /*
- * The helper below must not be called without checking
- * register_op_available() first, but guard the function pointer anyway.
+ * The two helpers below must not be called without checking
+ * register_op_available() first, but guard the function pointers anyway: an
+ * opaque master may implement only one of the two directions.
  */
 static int read_register(struct flashctx *flash, enum flash_reg reg, uint8_t *value)
 {
@@ -326,6 +336,16 @@ static int read_register(struct flashctx *flash, enum flash_reg reg, uint8_t *va
 	return spi_read_register(flash, reg, value);
 }
 
+static int write_register(struct flashctx *flash, enum flash_reg reg, uint8_t value)
+{
+	if (flash->mst->buses_supported & BUS_PROG) {
+		if (!flash->mst->opaque.write_register)
+			return SPI_INVALID_OPCODE;
+		return flash->mst->opaque.write_register(flash, reg, value);
+	}
+
+	return spi_write_register(flash, reg, value);
+}
 
 /* Print a single register, or all registers the chip implements if reg is MAX_REGISTERS. */
 static int read_register_cli(struct flashctx *flash, enum flash_reg reg)
@@ -333,7 +353,7 @@ static int read_register_cli(struct flashctx *flash, enum flash_reg reg)
 	const bool read_all = (reg == MAX_REGISTERS);
 	bool printed_any = false;
 
-	if (!register_op_available(flash)) {
+	if (!register_op_available(flash, false)) {
 		msg_gerr("Error: Reading registers is not supported by the programmer.\n");
 		return 1;
 	}
@@ -350,7 +370,7 @@ static int read_register_cli(struct flashctx *flash, enum flash_reg reg)
 		 * and SECURITY instead. Only registers the chip actually
 		 * implements are printed for ALL.
 		 */
-		if (!register_supported_by_chip(flash, r)) {
+		if (!register_supported_by_chip(flash, r, false)) {
 			if (read_all) {
 				msg_pdbg("Register %s is not implemented by this chip, skipping.\n",
 					 flash_reg_to_name(r));
@@ -389,6 +409,93 @@ static int read_register_cli(struct flashctx *flash, enum flash_reg reg)
 	return 0;
 }
 
+/*
+ * force is passed in rather than read from flash->flags, because main() only
+ * sets FLASHROM_FLAG_FORCE after the register operations have run.
+ */
+static int write_register_cli(struct flashctx *flash, enum flash_reg reg, uint8_t value, bool force)
+{
+	const char *reg_name = flash_reg_to_name(reg);
+	uint8_t old_value, new_value;
+	bool have_old_value = false;
+
+	/*
+	 * The security register is special: its bits are one-time programmable
+	 * and are set by dedicated commands, so it is never writable as a
+	 * register. This is a property of the chip rather than of the
+	 * programmer, so check it first, and independently of the master: an
+	 * opaque master is not covered by register_supported_by_chip().
+	 */
+	if (reg == SECURITY) {
+		msg_gerr("Error: Register %s cannot be written by design.\n", reg_name);
+		return 1;
+	}
+
+	if (!register_op_available(flash, true)) {
+		msg_gerr("Error: Writing registers is not supported by the programmer.\n");
+		return 1;
+	}
+
+	if (!register_supported_by_chip(flash, reg, true)) {
+		msg_gerr("Error: Register %s is not writable on chip \"%s\".\n",
+			 reg_name, flash->chip->name);
+		return 1;
+	}
+
+	/*
+	 * Writing a register replaces the whole byte and bypasses the write
+	 * protection logic, which only ever touches bits it knows to be
+	 * writable. A single wrong value can permanently lock the chip, e.g.
+	 * SRP1:SRP0 = 1:1 selects one time programmable mode on many Winbond
+	 * chips. Ask the user to confirm that this is intended.
+	 */
+	if (!force) {
+		msg_gerr("Error: Writing register %s bypasses all write protection handling\n"
+			 "and can permanently lock the chip. Re-run with -f/--force if that is\n"
+			 "intended.\n", reg_name);
+		return 1;
+	}
+
+	/*
+	 * Reading the register back is optional: the programmer may implement
+	 * only the write direction, and not every writable register is
+	 * readable.
+	 */
+	const bool can_read_back = register_op_available(flash, false) &&
+				   register_supported_by_chip(flash, reg, false);
+
+	/* Purely informational, so ignore errors here. */
+	if (can_read_back && !read_register(flash, reg, &old_value))
+		have_old_value = true;
+
+	if (have_old_value)
+		msg_pinfo("Writing register %s: 0x%02x -> 0x%02x\n", reg_name, old_value, value);
+	else
+		msg_pinfo("Writing register %s: 0x%02x\n", reg_name, value);
+
+	int rc = write_register(flash, reg, value);
+	if (rc == SPI_INVALID_OPCODE) {
+		msg_gerr("Error: Writing register %s is not supported by the programmer.\n", reg_name);
+		return 1;
+	}
+	if (rc) {
+		msg_gerr("Error: Failed to write register %s.\n", reg_name);
+		return 1;
+	}
+
+	/*
+	 * Read the register back if possible. Registers commonly contain
+	 * volatile, reserved or OTP bits, so a mismatch is not necessarily an
+	 * error, but the user should know about it.
+	 */
+	if (can_read_back && !read_register(flash, reg, &new_value) && new_value != value) {
+		msg_gwarn("Warning: Register %s reads back as 0x%02x instead of 0x%02x.\n",
+			  reg_name, new_value, value);
+	}
+
+	msg_ginfo("Successfully wrote 0x%02x to register %s.\n", value, reg_name);
+	return 0;
+}
 
 static int wp_cli(
 		struct flashctx *flash,
@@ -911,13 +1018,47 @@ static void parse_options(int argc, char **argv, const char *optstring,
 		case OPTION_READ_REGISTER:
 			cli_classic_validate_singleop(&operation_specified);
 			options->read_register = true;
-			options->reg = parse_register_name(optarg);
+			options->reg = parse_register_name(optarg, true);
 			if (options->reg == INVALID_REG) {
 				msg_gerr("Error: Invalid register name \"%s\".\n", optarg);
 				print_supported_register_names(true);
 				cli_classic_abort_usage(NULL);
 			}
 			break;
+		case OPTION_WRITE_REGISTER:
+		{
+			cli_classic_validate_singleop(&operation_specified);
+			options->write_register = true;
+
+			/* The argument has the form <register>=<hex value>. */
+			const char *eq = strchr(optarg, '=');
+			if (!eq || eq == optarg || eq[1] == '\0')
+				cli_classic_abort_usage("Error: --write-register requires the "
+							"format <register>=<value>.\n");
+
+			char *reg_name = strndup(optarg, eq - optarg);
+			if (!reg_name)
+				cli_classic_abort_usage("Out of memory.\n");
+			options->reg = parse_register_name(reg_name, false);
+			if (options->reg == INVALID_REG) {
+				msg_gerr("Error: Invalid register name \"%s\".\n", reg_name);
+				print_supported_register_names(false);
+				free(reg_name);
+				cli_classic_abort_usage(NULL);
+			}
+			free(reg_name);
+
+			/* Values are hexadecimal, with or without a 0x prefix. */
+			char *endptr;
+			errno = 0;
+			unsigned long value = strtoul(eq + 1, &endptr, 16);
+			if (errno || *endptr != '\0' || value > UINT8_MAX) {
+				msg_gerr("Error: Invalid hexadecimal byte value \"%s\".\n", eq + 1);
+				cli_classic_abort_usage(NULL);
+			}
+			options->reg_value = (uint8_t)value;
+			break;
+		}
 		case OPTION_WP_STATUS:
 			options->print_wp_status = true;
 			break;
@@ -1073,6 +1214,7 @@ int main(int argc, char *argv[])
 		{"flash-size",		0, NULL, OPTION_FLASH_SIZE},
 		{"get-size",		0, NULL, OPTION_FLASH_SIZE}, // (deprecated): back compatibility.
 		{"read-register",	1, NULL, OPTION_READ_REGISTER},
+		{"write-register",	1, NULL, OPTION_WRITE_REGISTER},
 		{"wp-status",		0, NULL, OPTION_WP_STATUS},
 		{"wp-list",		0, NULL, OPTION_WP_LIST},
 		{"wp-range",		1, NULL, OPTION_WP_SET_RANGE},
@@ -1306,7 +1448,8 @@ int main(int argc, char *argv[])
 
 	const bool any_op = options.read_it || options.write_it || options.verify_it ||
 		options.erase_it || options.flash_name || options.flash_size ||
-		options.extract_it || options.read_register || any_wp_op;
+		options.extract_it || options.read_register ||
+		options.write_register || any_wp_op;
 
 	if (!any_op) {
 		msg_ginfo("No operations were specified.\n");
@@ -1414,6 +1557,12 @@ int main(int argc, char *argv[])
 
 	if (options.read_register) {
 		ret = read_register_cli(fill_flash, options.reg);
+		if (ret)
+			goto out_release;
+	}
+
+	if (options.write_register) {
+		ret = write_register_cli(fill_flash, options.reg, options.reg_value, options.force);
 		if (ret)
 			goto out_release;
 	}
