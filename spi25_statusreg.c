@@ -58,6 +58,62 @@ static int spi_prepare_wrsr_ext(
 	return 0;
 }
 
+/*
+ * How a given register is written on a given chip. Determined by the chip's
+ * feature bits alone, so this can be evaluated without touching the bus.
+ */
+enum spi_wrsr_method {
+	WRSR_UNSUPPORTED = 0,	/* The chip cannot write this register. */
+	WRSR_SR1,		/* WRSR (01h), one data byte. */
+	WRSR_SR2,		/* WRSR2 (31h), one data byte. */
+	WRSR_SR3,		/* WRSR3 (11h), one data byte. */
+	WRSR_EXT,		/* WRSR (01h) with all lower SRx written back. */
+	WRSR_CFG,		/* WRSR (01h) with SR1 written back plus CR. */
+};
+
+static enum spi_wrsr_method spi_resolve_write_register_method(const struct flashctx *flash, enum flash_reg reg)
+{
+	const int feature_bits = flash->chip->feature_bits;
+
+	switch (reg) {
+	case STATUS1:
+		return WRSR_SR1;
+	case STATUS2:
+		if (feature_bits & FEATURE_WRSR2)
+			return WRSR_SR2;
+		if (feature_bits & FEATURE_WRSR_EXT2)
+			return WRSR_EXT;
+		return WRSR_UNSUPPORTED;
+	case STATUS3:
+		if (feature_bits & FEATURE_WRSR3)
+			return WRSR_SR3;
+		if ((feature_bits & FEATURE_WRSR_EXT3) == FEATURE_WRSR_EXT3)
+			return WRSR_EXT;
+		return WRSR_UNSUPPORTED;
+	case SECURITY:
+		/*
+		 * Security register doesn't have a normal write operation. Instead,
+		 * there are separate commands that set individual OTP bits.
+		 */
+		return WRSR_UNSUPPORTED;
+	case CONFIG:
+		/*
+		 * This one is read via a separate command, but written as if it's SR2
+		 * in FEATURE_WRSR_EXT2 case of WRSR command.
+		 */
+		if (feature_bits & FEATURE_CFGR)
+			return WRSR_CFG;
+		return WRSR_UNSUPPORTED;
+	default:
+		return WRSR_UNSUPPORTED;
+	}
+}
+
+bool spi_register_writable(const struct flashctx *flash, enum flash_reg reg)
+{
+	return spi_resolve_write_register_method(flash, reg) != WRSR_UNSUPPORTED;
+}
+
 int spi_write_register(const struct flashctx *flash, enum flash_reg reg, uint8_t value)
 {
 	int feature_bits = flash->chip->feature_bits;
@@ -69,66 +125,43 @@ int spi_write_register(const struct flashctx *flash, enum flash_reg reg, uint8_t
 	 * Create SPI write command sequence based on the destination register
 	 * and the chip's supported command set.
 	 */
-	switch (reg) {
-	case STATUS1:
+	switch (spi_resolve_write_register_method(flash, reg)) {
+	case WRSR_SR1:
 		write_cmd[0] = JEDEC_WRSR;
 		write_cmd[1] = value;
 		write_cmd_len = JEDEC_WRSR_OUTSIZE;
 		break;
-	case STATUS2:
-		if (feature_bits & FEATURE_WRSR2) {
-			write_cmd[0] = JEDEC_WRSR2;
-			write_cmd[1] = value;
-			write_cmd_len = JEDEC_WRSR2_OUTSIZE;
-			break;
+	case WRSR_SR2:
+		write_cmd[0] = JEDEC_WRSR2;
+		write_cmd[1] = value;
+		write_cmd_len = JEDEC_WRSR2_OUTSIZE;
+		break;
+	case WRSR_SR3:
+		write_cmd[0] = JEDEC_WRSR3;
+		write_cmd[1] = value;
+		write_cmd_len = JEDEC_WRSR3_OUTSIZE;
+		break;
+	case WRSR_EXT:
+		if (spi_prepare_wrsr_ext(write_cmd, &write_cmd_len, flash, reg, value))
+			return 1;
+		break;
+	case WRSR_CFG:
+		write_cmd[0] = JEDEC_WRSR;
+		if (spi_read_register(flash, STATUS1, &write_cmd[1])) {
+			msg_cerr("Writing CONFIG failed: failed to read SR1 for writeback.\n");
+			return 1;
 		}
-		if (feature_bits & FEATURE_WRSR_EXT2) {
-			if (spi_prepare_wrsr_ext(write_cmd, &write_cmd_len, flash, reg, value))
-				return 1;
-			break;
-		}
-		msg_cerr("Cannot write SR2: unsupported by chip\n");
-		return 1;
-	case STATUS3:
-		if (feature_bits & FEATURE_WRSR3) {
-			write_cmd[0] = JEDEC_WRSR3;
-			write_cmd[1] = value;
-			write_cmd_len = JEDEC_WRSR3_OUTSIZE;
-			break;
-		}
-		if ((feature_bits & FEATURE_WRSR_EXT3) == FEATURE_WRSR_EXT3) {
-			if (spi_prepare_wrsr_ext(write_cmd, &write_cmd_len, flash, reg, value))
-				return 1;
-			break;
-		}
-		msg_cerr("Cannot write SR3: unsupported by chip\n");
-		return 1;
-	case SECURITY:
-		/*
-		 * Security register doesn't have a normal write operation. Instead,
-		 * there are separate commands that set individual OTP bits.
-		 */
-		msg_cerr("Cannot write SECURITY: unsupported by design\n");
-		return 1;
-	case CONFIG:
-		/*
-		 * This one is read via a separate command, but written as if it's SR2
-		 * in FEATURE_WRSR_EXT2 case of WRSR command.
-		 */
-		if (feature_bits & FEATURE_CFGR) {
-			write_cmd[0] = JEDEC_WRSR;
-			if (spi_read_register(flash, STATUS1, &write_cmd[1])) {
-				msg_cerr("Writing CONFIG failed: failed to read SR1 for writeback.\n");
-				return 1;
-			}
-			write_cmd[2] = value;
-			write_cmd_len = 3;
-			break;
-		}
-		msg_cerr("Cannot write CONFIG: unsupported by chip\n");
-		return 1;
+		write_cmd[2] = value;
+		write_cmd_len = 3;
+		break;
+	case WRSR_UNSUPPORTED:
 	default:
-		msg_cerr("Cannot write register: unknown register\n");
+		if (reg == SECURITY)
+			msg_cerr("Cannot write SECURITY: unsupported by design\n");
+		else if (reg > INVALID_REG && reg < MAX_REGISTERS)
+			msg_cerr("Cannot write %s: unsupported by chip\n", flash_reg_to_name(reg));
+		else
+			msg_cerr("Cannot write register: unknown register\n");
 		return 1;
 	}
 
@@ -203,46 +236,65 @@ int spi_write_register(const struct flashctx *flash, enum flash_reg reg, uint8_t
 	return TIMEOUT_ERROR;
 }
 
-int spi_read_register(const struct flashctx *flash, enum flash_reg reg, uint8_t *value)
+/*
+ * Look up the opcode used to read a register on this chip. Returns 0 on
+ * success, 1 if the chip does not implement the register. Prints nothing so
+ * that it can be used to probe for register support.
+ */
+static int spi_resolve_read_register_opcode(const struct flashctx *flash, enum flash_reg reg, uint8_t *opcode)
 {
-	int feature_bits = flash->chip->feature_bits;
-	uint8_t read_cmd;
+	const int feature_bits = flash->chip->feature_bits;
 
 	switch (reg) {
 	case STATUS1:
-		read_cmd = JEDEC_RDSR;
-		break;
+		*opcode = JEDEC_RDSR;
+		return 0;
 	case STATUS2:
 		if (feature_bits & (FEATURE_WRSR_EXT2 | FEATURE_WRSR2)) {
-			read_cmd = JEDEC_RDSR2;
-			break;
+			*opcode = JEDEC_RDSR2;
+			return 0;
 		}
-		msg_cerr("Cannot read SR2: unsupported by chip\n");
 		return 1;
 	case STATUS3:
 		if ((feature_bits & FEATURE_WRSR_EXT3) == FEATURE_WRSR_EXT3
 		    || (feature_bits & FEATURE_WRSR3)) {
-			read_cmd = JEDEC_RDSR3;
-			break;
+			*opcode = JEDEC_RDSR3;
+			return 0;
 		}
-		msg_cerr("Cannot read SR3: unsupported by chip\n");
 		return 1;
 	case SECURITY:
 		if (feature_bits & FEATURE_SCUR) {
-			read_cmd = JEDEC_RDSCUR;
-			break;
+			*opcode = JEDEC_RDSCUR;
+			return 0;
 		}
-		msg_cerr("Cannot read SECURITY: unsupported by chip\n");
 		return 1;
 	case CONFIG:
 		if (feature_bits & FEATURE_CFGR) {
-			read_cmd = JEDEC_RDCR;
-			break;
+			*opcode = JEDEC_RDCR;
+			return 0;
 		}
-		msg_cerr("Cannot read CONFIG: unsupported by chip\n");
 		return 1;
 	default:
-		msg_cerr("Cannot read register: unknown register\n");
+		return 1;
+	}
+}
+
+bool spi_register_readable(const struct flashctx *flash, enum flash_reg reg)
+{
+	uint8_t opcode;
+
+	return spi_resolve_read_register_opcode(flash, reg, &opcode) == 0;
+}
+
+int spi_read_register(const struct flashctx *flash, enum flash_reg reg, uint8_t *value)
+{
+	uint8_t read_cmd;
+
+	if (spi_resolve_read_register_opcode(flash, reg, &read_cmd)) {
+		if (reg > INVALID_REG && reg < MAX_REGISTERS)
+			msg_cerr("Cannot read %s: unsupported by chip\n", flash_reg_to_name(reg));
+		else
+			msg_cerr("Cannot read register: unknown register\n");
 		return 1;
 	}
 
