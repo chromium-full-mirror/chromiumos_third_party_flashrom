@@ -1326,21 +1326,26 @@ notfound:
 }
 
 /*
- * Gets the lowest erase granularity; it is used when
+ * Gets the largest sub-chip erase granularity; it is used when
  * deciding if the layout map needs to be adjusted such that erase boundaries
- * match this granularity. Returns -1 if unsuccessful.
+ * match the largest block size that erase_and_write_flash() / fold_range_maps()
+ * may upgrade to. Returns -1 if unsuccessful.
  */
 static int get_required_erase_size(struct flashctx *flash)
 {
-	int i, erase_size_found = 0;
-	unsigned int required_erase_size;
+	int i;
+	unsigned int required_erase_size = 0;
+	const unsigned int chip_size = flash->chip->total_size * 1024;
+	bool has_full_chip_eraser = false;
 
 	/*
-	 * Find eraseable block size for read alignment.
-	 * FIXME: This assumes the smallest block erase size is useable
-	 * by erase_and_write_flash().
+	 * Find the largest sub-chip eraseable block size for read alignment,
+	 * because action_descriptor's fold_range_maps() (70% rule) may promote
+	 * smaller block erases up to the largest sub-chip block size (e.g. 64 KiB).
+	 * Full-chip erasers are skipped. An eraseblock larger than the chip is
+	 * a broken chip definition; selfcheck() only covers flashchips[], not
+	 * chips built at runtime (SFDP, linux_mtd, cros_ec), so reject it here.
 	 */
-	required_erase_size = ~0;
 	for (i = 0; i < NUM_ERASEFUNCTIONS; i++) {
 		struct block_eraser eraser = flash->chip->block_erasers[i];
 		int j;
@@ -1348,15 +1353,28 @@ static int get_required_erase_size(struct flashctx *flash)
 		for (j = 0; j < NUM_ERASEREGIONS; j++) {
 			unsigned int size = eraser.eraseblocks[j].size;
 
-			if (size && (size < required_erase_size)) {
-				required_erase_size = size;
-				erase_size_found = 1;
+			if (!size)
+				continue;
+			if (size > chip_size) {
+				msg_cerr("%s: eraseblock size %#x exceeds chip size %#x.\n",
+					 __func__, size, chip_size);
+				return -1;
 			}
+			if (size == chip_size) {
+				has_full_chip_eraser = true;
+				continue;
+			}
+			if (size > required_erase_size)
+				required_erase_size = size;
 		}
 	}
 
+	/* Chips with only a full-chip eraser (e.g. FEATURE_NO_ERASE). */
+	if (!required_erase_size && has_full_chip_eraser)
+		required_erase_size = chip_size;
+
 	/* likely an error in flashchips[] */
-	if (!erase_size_found) {
+	if (!required_erase_size) {
 		msg_cerr("%s: No usable erase size found.\n", __func__);
 		return -1;
 	}
@@ -2565,7 +2583,6 @@ static int setup_curcontents(struct flashctx *flashctx, void *curcontents,
 				return 1;
 			}
 		} else {
-			/* WARNING: See FIXME on get_required_erase_size() */
 			if (read_by_layout(flashctx, curcontents, true)) {
 				msg_cinfo("FAILED.\n");
 				return 1;

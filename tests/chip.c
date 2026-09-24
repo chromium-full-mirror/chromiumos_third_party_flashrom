@@ -540,6 +540,64 @@ void write_nonaligned_region_with_dummyflasher_test_success(void **state)
 	free(newcontents);
 }
 
+void write_region_fold_larger_block_with_dummyflasher_test_success(void **state)
+{
+	(void) state; /* unused */
+
+	static struct io_mock_fallback_open_state data = {
+		.noc	= 0,
+		.paths	= { NULL },
+	};
+	const struct io_mock chip_io = {
+		.fallback_open_state = &data,
+	};
+
+	struct flashrom_flashctx flashctx = { 0 };
+	struct flashrom_layout *layout;
+	struct flashchip mock_chip = chip_W25Q128_V;
+	const uint32_t mock_chip_size = mock_chip.total_size * KiB;
+	const char *param_dup = "bus=spi,emulate=W25Q128FV";
+
+	uint8_t *newcontents = calloc(1, mock_chip_size);
+	assert_non_null(newcontents);
+	memset(newcontents, MOCK_CHIP_SUBREGION_CONTENTS, mock_chip_size);
+
+	setup_chip(&flashctx, &layout, &mock_chip, param_dup, &chip_io);
+	flashrom_flag_set(&flashctx, FLASHROM_FLAG_VERIFY_AFTER_WRITE, true);
+	flashrom_flag_set(&flashctx, FLASHROM_FLAG_VERIFY_WHOLE_CHIP, false);
+
+	/* Initialize full mock chip with MOCK_CHIP_SUBREGION_CONTENTS (0xCC). */
+	assert_int_equal(0, flashrom_image_write(&flashctx, newcontents, mock_chip_size, NULL));
+	flashrom_layout_release(layout);
+
+	/*
+	 * Create a 4 KiB-aligned region (56 KiB at offset 8 KiB, i.e. [8 KiB, 64 KiB))
+	 * that covers >70% (14/16 = 87.5%) of the first 64 KiB block [0, 64 KiB).
+	 * This triggers action_descriptor's 70% rule to fold the erase to 64 KiB while
+	 * FLASHROM_FLAG_VERIFY_WHOLE_CHIP is false (-N), verifying that the preceding
+	 * 8 KiB [0, 8 KiB) outside the region is read and preserved rather than
+	 * overwritten with 0x00 (b/565611178).
+	 */
+	assert_int_equal(0, flashrom_layout_new(&layout));
+	assert_int_equal(0, flashrom_layout_add_region(layout, 8 * KiB, (64 * KiB) - 1, "FW_MAIN_A"));
+	assert_int_equal(0, flashrom_layout_include_region(layout, "FW_MAIN_A"));
+	flashrom_layout_set(&flashctx, layout);
+
+	memset(newcontents + 8 * KiB, 0xAA, 56 * KiB);
+	assert_int_equal(0, flashrom_image_write(&flashctx, newcontents, mock_chip_size, NULL));
+
+	flashrom_layout_release(layout);
+	assert_int_equal(0, flashrom_layout_new(&layout));
+	assert_int_equal(0, flashrom_layout_add_region(layout, 0, mock_chip_size - 1, "entire"));
+	assert_int_equal(0, flashrom_layout_include_region(layout, "entire"));
+	flashrom_layout_set(&flashctx, layout);
+
+	assert_int_equal(0, flashrom_image_verify(&flashctx, newcontents, mock_chip_size));
+
+	teardown(&layout);
+	free(newcontents);
+}
+
 static size_t verify_chip_fread(void *state, void *buf, size_t size, size_t len, FILE *fp)
 {
 	/*

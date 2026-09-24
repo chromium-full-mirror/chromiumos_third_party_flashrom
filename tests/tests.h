@@ -89,6 +89,7 @@ void write_chip_test_success(void **state);
 void write_chip_with_dummyflasher_test_success(void **state);
 void write_chip_feature_no_erase(void **state);
 void write_nonaligned_region_with_dummyflasher_test_success(void **state);
+void write_region_fold_larger_block_with_dummyflasher_test_success(void **state);
 void verify_chip_test_success(void **state);
 void verify_chip_with_dummyflasher_test_success(void **state);
 

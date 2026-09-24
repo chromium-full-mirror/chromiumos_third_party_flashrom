@@ -284,6 +284,22 @@ static size_t fill_sorted_erasers(struct flashctx *flash,
 		j++;
         }
 
+	/*
+	 * When partial verification (!verify_whole_chip / -N) is used,
+	 * read_by_layout() only aligns partial reads up to the largest
+	 * sub-chip block size (e.g. 64 KiB), not the full chip size.
+	 * Drop any full-chip eraser from the top of sorted_erasers if
+	 * smaller block erasers are available, so fold_range_maps()
+	 * cannot upgrade into a full-chip erase that wipes unread areas.
+	 */
+	if (!flash->flags.verify_whole_chip && j > 1) {
+		size_t top_fn = sorted_erasers[j - 1].eraser_index;
+		size_t top_reg = sorted_erasers[j - 1].region_index;
+		if (chip.block_erasers[top_fn].eraseblocks[top_reg].size >=
+		    (size_t)chip.total_size * 1024)
+			j--;
+	}
+
 	if (j) {
 		msg_pdbg("%s: found %zd valid erasers\n", __func__, j);
 		return j;
