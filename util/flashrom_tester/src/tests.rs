@@ -33,7 +33,6 @@
 // Software Foundation.
 //
 
-#[cfg(feature = "chromeos-host")]
 use super::cros_sysinfo;
 use super::tester::{self, OutputFormat, TestCase, TestEnv, TestResult};
 use super::utils;
@@ -132,22 +131,11 @@ pub fn generic<'a, TN: Iterator<Item = &'a str>>(
         warn!("No test matches filter name \"{}\"", leftover);
     }
 
-    #[cfg(feature = "chromeos-host")]
-    let (os_release, cros_release, system_info, bios_info) = {
-        let os_release = sys_info::os_release().unwrap_or("<Unknown OS>".to_string());
-        let cros_release = cros_sysinfo::release_description()
-            .unwrap_or("<Unknown or not a ChromeOS release>".to_string());
-        let system_info = cros_sysinfo::system_info().unwrap_or("<Unknown System>".to_string());
-        let bios_info = cros_sysinfo::bios_info().unwrap_or("<Unknown BIOS>".to_string());
-        (os_release, cros_release, system_info, bios_info)
-    };
-    #[cfg(not(feature = "chromeos-host"))]
-    let (os_release, cros_release, system_info, bios_info) = (
-        "<Unknown OS>".to_string(),
-        "<Unknown or not a ChromeOS release>".to_string(),
-        "<Unknown System>".to_string(),
-        "<Unknown BIOS>".to_string(),
-    );
+    let os_release = cros_sysinfo::os_release().unwrap_or("<Unknown OS>".to_string());
+    let cros_release = cros_sysinfo::release_description()
+        .unwrap_or("<Unknown or not a ChromeOS release>".to_string());
+    let system_info = cros_sysinfo::system_info().unwrap_or("<Unknown System>".to_string());
+    let bios_info = cros_sysinfo::bios_info().unwrap_or("<Unknown BIOS>".to_string());
 
     let meta_data = tester::ReportMetaData {
         chip_name,

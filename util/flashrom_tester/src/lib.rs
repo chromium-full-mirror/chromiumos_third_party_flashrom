@@ -39,7 +39,6 @@ extern crate log;
 #[macro_use]
 pub mod types;
 
-#[cfg(feature = "chromeos-host")]
 pub mod cros_sysinfo;
 pub mod rand_util;
 pub mod tester;
