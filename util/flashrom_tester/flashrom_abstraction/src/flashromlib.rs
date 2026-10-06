@@ -65,7 +65,7 @@ impl crate::Flashrom for FlashromLib {
     }
 
     fn name(&self) -> Result<(String, String), FlashromError> {
-        Ok(("not".to_string(), "implemented".to_string()))
+        Ok(self.flashrom.borrow().get_name())
     }
 
     fn wp_range(&self, range: (i64, i64), wp_enable: bool) -> Result<bool, FlashromError> {

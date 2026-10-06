@@ -585,6 +585,32 @@ impl Chip {
         unsafe { libflashrom_sys::flashrom_flash_getsize(self.ctx.as_ref()) }
     }
 
+    /// Returns the `(vendor, name)` of the probed [`Chip`].
+    pub fn get_name(&self) -> (String, String) {
+        let mut info = std::mem::MaybeUninit::<libflashrom_sys::flashrom_flashchip_info>::zeroed();
+        // SAFETY: `self.ctx` is a valid probed flash context and `info` is a
+        // valid mutable pointer to `flashrom_flashchip_info`, which
+        // `flashrom_flash_getinfo` initializes.
+        let info = unsafe {
+            libflashrom_sys::flashrom_flash_getinfo(self.ctx.as_ref(), info.as_mut_ptr());
+            info.assume_init()
+        };
+        let to_owned = |ptr: *const std::os::raw::c_char| {
+            if ptr.is_null() {
+                String::new()
+            } else {
+                // SAFETY: `flashrom_flash_getinfo` returns NUL-terminated
+                // strings owned by `self.ctx->chip` (e.g. `flashchips` static
+                // literals, `ichspi` hwseq table, or `cros_ec` static buffers),
+                // which remain valid for the lifetime of `&self`.
+                unsafe { CStr::from_ptr(ptr) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        (to_owned(info.vendor), to_owned(info.name))
+    }
+
     /// Read the write protect config of this [`Chip`]
     pub fn get_wp(&mut self) -> std::result::Result<WriteProtectCfg, WPError> {
         let mut cfg = WriteProtectCfg::new()?;
@@ -1340,6 +1366,21 @@ mod tests {
                 libflashrom_sys::flashrom_wp_mode::FLASHROM_WP_MODE_DISABLED
             );
             assert_eq!(wp.get_range(), 100..200);
+        });
+    }
+
+    #[test]
+    fn get_name() {
+        run_in_fork(|| {
+            let chip = Chip::new(
+                Programmer::new("dummy", Some("emulate=W25Q128FV")).unwrap(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                chip.get_name(),
+                ("Winbond".to_string(), "W25Q128.V".to_string())
+            );
         });
     }
 }
