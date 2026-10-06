@@ -137,6 +137,83 @@ static const struct flashchip chip_8MiB = {
 	 }},
 };
 
+/* Same as chip_8MiB but with 4 KiB / 32 KiB / 64 KiB / chip erasers. */
+static const struct flashchip chip_8MiB_4k_32k_64k = {
+	.vendor		= "aklm",
+	.total_size	= MOCK_CHIP_SIZE / KiB,
+	.tested		= TEST_OK_PREW,
+	.gran		= WRITE_GRAN_256BYTES,
+	.read		= TEST_READ_INJECTOR,
+	.write		= TEST_WRITE_INJECTOR,
+	.block_erasers	=
+	{
+		{
+			.eraseblocks = { {4 * KiB, MOCK_CHIP_SIZE / (4 * KiB)} },
+			.block_erase = TEST_ERASE_INJECTOR,
+		}, {
+			.eraseblocks = { {32 * KiB, MOCK_CHIP_SIZE / (32 * KiB)} },
+			.block_erase = TEST_ERASE_INJECTOR,
+		}, {
+			.eraseblocks = { {64 * KiB, MOCK_CHIP_SIZE / (64 * KiB)} },
+			.block_erase = TEST_ERASE_INJECTOR,
+		}, {
+			.eraseblocks = { {MOCK_CHIP_SIZE, 1} },
+			.block_erase = TEST_ERASE_INJECTOR,
+		}
+	},
+};
+
+/*
+ * Top-boot chip with non-uniform eraseblocks within one eraser. The smallest
+ * eraseblock is 4 KiB, but action_descriptor picks a single eraseblock size
+ * per eraser and uses 64 KiB as its smallest erase granularity here.
+ */
+static const struct flashchip chip_8MiB_top_boot = {
+	.vendor		= "aklm",
+	.total_size	= MOCK_CHIP_SIZE / KiB,
+	.tested		= TEST_OK_PREW,
+	.gran		= WRITE_GRAN_256BYTES,
+	.read		= TEST_READ_INJECTOR,
+	.write		= TEST_WRITE_INJECTOR,
+	.block_erasers	=
+	{
+		{
+			.eraseblocks = { {64 * KiB, 127}, {32 * KiB, 1}, {16 * KiB, 1},
+					 {8 * KiB, 1}, {4 * KiB, 2} },
+			.block_erase = TEST_ERASE_INJECTOR,
+		}, {
+			.eraseblocks = { {MOCK_CHIP_SIZE, 1} },
+			.block_erase = TEST_ERASE_INJECTOR,
+		}
+	},
+};
+
+/* Records erase invocations by block size, for asserting erase placement. */
+static struct {
+	unsigned int count_4k;
+	unsigned int count_32k;
+	unsigned int count_64k;
+	unsigned int count_other;
+	unsigned int min_addr;
+	unsigned int max_end;
+} g_erase_log;
+
+static int block_erase_chip_record(struct flashctx *flash, unsigned int blockaddr, unsigned int blocklen)
+{
+	switch (blocklen) {
+	case 4 * KiB:	g_erase_log.count_4k++; break;
+	case 32 * KiB:	g_erase_log.count_32k++; break;
+	case 64 * KiB:	g_erase_log.count_64k++; break;
+	default:	g_erase_log.count_other++; break;
+	}
+	if (blockaddr < g_erase_log.min_addr)
+		g_erase_log.min_addr = blockaddr;
+	if (blockaddr + blocklen > g_erase_log.max_end)
+		g_erase_log.max_end = blockaddr + blocklen;
+
+	return block_erase_chip(flash, blockaddr, blocklen);
+}
+
 /* Chip expected to be processed with dummyflasher, so using real op functions. */
 static const struct flashchip chip_no_erase = {
 	.vendor		= "aklm&dummyflasher",
@@ -571,12 +648,11 @@ void write_region_fold_larger_block_with_dummyflasher_test_success(void **state)
 	flashrom_layout_release(layout);
 
 	/*
-	 * Create a 4 KiB-aligned region (56 KiB at offset 8 KiB, i.e. [8 KiB, 64 KiB))
-	 * that covers >70% (14/16 = 87.5%) of the first 64 KiB block [0, 64 KiB).
-	 * This triggers action_descriptor's 70% rule to fold the erase to 64 KiB while
-	 * FLASHROM_FLAG_VERIFY_WHOLE_CHIP is false (-N), verifying that the preceding
-	 * 8 KiB [0, 8 KiB) outside the region is read and preserved rather than
-	 * overwritten with 0x00 (b/565611178).
+	 * Write a 4 KiB-aligned region (56 KiB at offset 8 KiB, i.e. [8 KiB, 64 KiB))
+	 * that is not aligned to the largest erase block, with partial verification
+	 * (-N), through the emulated SPI chip. The preceding 8 KiB [0, 8 KiB) shares
+	 * the first 64 KiB block with the region but lies outside the layout, and must
+	 * be preserved rather than overwritten with 0x00 (b/565611178).
 	 */
 	assert_int_equal(0, flashrom_layout_new(&layout));
 	assert_int_equal(0, flashrom_layout_add_region(layout, 8 * KiB, (64 * KiB) - 1, "FW_MAIN_A"));
@@ -596,6 +672,180 @@ void write_region_fold_larger_block_with_dummyflasher_test_success(void **state)
 
 	teardown(&layout);
 	free(newcontents);
+}
+
+struct test_region {
+	chipoff_t start;
+	chipoff_t end;
+	const char *name;
+	uint8_t fill;
+};
+
+/*
+ * Writes the given regions (each filled with its own byte) to the given mock
+ * chip, initially filled with MOCK_CHIP_CONTENT, recording every erase in
+ * g_erase_log. The caller asserts on g_erase_log and g_chip_state.
+ */
+static void write_regions_and_log_erases(const struct flashchip *chip,
+					 const struct test_region *regions, size_t num_regions,
+					 bool verify_whole_chip)
+{
+	static struct io_mock_fallback_open_state data = {
+		.noc	= 0,
+		.paths	= { NULL },
+	};
+	const struct io_mock chip_io = {
+		.fallback_open_state = &data,
+	};
+
+	erasefunc_t *const saved_erase_injector = g_test_erase_injector;
+	g_test_write_injector = write_chip;
+	g_test_read_injector = read_chip;
+	g_test_erase_injector = block_erase_chip_record;
+	struct flashrom_flashctx flashctx = { 0 };
+	struct flashrom_layout *layout;
+	struct flashchip mock_chip = *chip;
+	const char *param = ""; /* Default values for all params. */
+
+	/* setup_chip() fills the mock chip with MOCK_CHIP_CONTENT (0xCC). */
+	setup_chip(&flashctx, &layout, &mock_chip, param, &chip_io);
+	flashrom_flag_set(&flashctx, FLASHROM_FLAG_VERIFY_AFTER_WRITE, true);
+	flashrom_flag_set(&flashctx, FLASHROM_FLAG_VERIFY_WHOLE_CHIP, verify_whole_chip);
+
+	/*
+	 * Whole-chip verification uses the default layout, which is normally
+	 * created while probing. This test does not probe, so create it here.
+	 */
+	assert_int_equal(0, flashrom_layout_new(&flashctx.default_layout));
+	assert_int_equal(0, flashrom_layout_add_region(flashctx.default_layout, 0,
+						       MOCK_CHIP_SIZE - 1, "complete flash"));
+	assert_int_equal(0, flashrom_layout_include_region(flashctx.default_layout,
+							   "complete flash"));
+
+	uint8_t *newcontents = malloc(MOCK_CHIP_SIZE);
+	assert_non_null(newcontents);
+	memset(newcontents, MOCK_CHIP_CONTENT, MOCK_CHIP_SIZE);
+
+	flashrom_layout_release(layout);
+	assert_int_equal(0, flashrom_layout_new(&layout));
+	for (size_t i = 0; i < num_regions; i++) {
+		const struct test_region *r = &regions[i];
+		assert_int_equal(0, flashrom_layout_add_region(layout, r->start, r->end, r->name));
+		assert_int_equal(0, flashrom_layout_include_region(layout, r->name));
+		memset(newcontents + r->start, r->fill, r->end - r->start + 1);
+	}
+	flashrom_layout_set(&flashctx, layout);
+
+	memset(&g_erase_log, 0, sizeof(g_erase_log));
+	g_erase_log.min_addr = ~0u;
+
+	assert_int_equal(0, flashrom_image_write(&flashctx, newcontents, MOCK_CHIP_SIZE, NULL));
+
+	teardown(&layout);
+	flashrom_layout_release(flashctx.default_layout);
+	free(newcontents);
+	g_test_erase_injector = saved_erase_injector;
+}
+
+/*
+ * Include only [8 KiB, 64 KiB): 14 of the 16 4 KiB blocks in the first
+ * 64 KiB block. The 70% rule would fold this into one 64 KiB erase, which
+ * must not happen because [0, 8 KiB) is outside the layout. The upper half
+ * [32 KiB, 64 KiB) lies entirely inside the region and is expected to fold
+ * into a single 32 KiB erase.
+ */
+static void assert_boundary_block_not_folded(bool verify_whole_chip)
+{
+	const struct test_region regions[] = {
+		{ 8 * KiB, (64 * KiB) - 1, "FW_MAIN_A", 0xAA },
+	};
+
+	write_regions_and_log_erases(&chip_8MiB_4k_32k_64k, regions, ARRAY_SIZE(regions), verify_whole_chip);
+
+	/* No erase may touch bytes outside the included region. */
+	assert_true(g_erase_log.min_addr >= 8 * KiB);
+	assert_true(g_erase_log.max_end <= 64 * KiB);
+
+	/* Folding still happens where it stays inside the region. */
+	assert_int_equal(6, g_erase_log.count_4k);	/* [8 KiB, 32 KiB) */
+	assert_int_equal(1, g_erase_log.count_32k);	/* [32 KiB, 64 KiB) */
+	assert_int_equal(0, g_erase_log.count_64k);
+	assert_int_equal(0, g_erase_log.count_other);
+
+	/* Neighbour untouched, region written. */
+	for (unsigned int i = 0; i < 8 * KiB; i++)
+		assert_int_equal(MOCK_CHIP_CONTENT, g_chip_state.buf[i]);
+	for (unsigned int i = 8 * KiB; i < 64 * KiB; i++)
+		assert_int_equal(0xAA, g_chip_state.buf[i]);
+}
+
+void write_region_does_not_erase_outside_layout_test_success(void **state)
+{
+	(void) state; /* unused */
+
+	/* Partial verification (-N). */
+	assert_boundary_block_not_folded(false);
+}
+
+void write_region_does_not_erase_outside_layout_verify_all_test_success(void **state)
+{
+	(void) state; /* unused */
+
+	/* Default mode: the whole chip is read, but erases still stay in the layout. */
+	assert_boundary_block_not_folded(true);
+}
+
+void write_adjacent_regions_fold_across_boundary_test_success(void **state)
+{
+	(void) state; /* unused */
+
+	/*
+	 * VBLOCK_A [0, 8 KiB) and FW_MAIN_A [8 KiB, 64 KiB) are both included,
+	 * so the whole 64 KiB block lies within the layout and may still be
+	 * folded into a single 64 KiB erase across the region boundary.
+	 */
+	const struct test_region regions[] = {
+		{ 0, (8 * KiB) - 1, "VBLOCK_A", 0x55 },
+		{ 8 * KiB, (64 * KiB) - 1, "FW_MAIN_A", 0xAA },
+	};
+
+	write_regions_and_log_erases(&chip_8MiB_4k_32k_64k, regions, ARRAY_SIZE(regions), false);
+
+	assert_int_equal(0, g_erase_log.count_4k);
+	assert_int_equal(0, g_erase_log.count_32k);
+	assert_int_equal(1, g_erase_log.count_64k);
+	assert_int_equal(0, g_erase_log.count_other);
+	assert_int_equal(0, g_erase_log.min_addr);
+	assert_int_equal(64 * KiB, g_erase_log.max_end);
+
+	for (unsigned int i = 0; i < 8 * KiB; i++)
+		assert_int_equal(0x55, g_chip_state.buf[i]);
+	for (unsigned int i = 8 * KiB; i < 64 * KiB; i++)
+		assert_int_equal(0xAA, g_chip_state.buf[i]);
+}
+
+void write_region_non_uniform_eraseblocks_test_success(void **state)
+{
+	(void) state; /* unused */
+
+	/*
+	 * On a chip with non-uniform eraseblocks, action_descriptor's smallest
+	 * erase granularity (64 KiB here) can exceed the smallest eraseblock
+	 * (4 KiB). Writing [8 KiB, 64 KiB) with partial verification erases the
+	 * whole first 64 KiB block, so [0, 8 KiB) must have been read and must
+	 * be restored. This fails if partial reads are only aligned to the
+	 * smallest eraseblock.
+	 */
+	const struct test_region regions[] = {
+		{ 8 * KiB, (64 * KiB) - 1, "FW_MAIN_A", 0xAA },
+	};
+
+	write_regions_and_log_erases(&chip_8MiB_top_boot, regions, ARRAY_SIZE(regions), false);
+
+	for (unsigned int i = 0; i < 8 * KiB; i++)
+		assert_int_equal(MOCK_CHIP_CONTENT, g_chip_state.buf[i]);
+	for (unsigned int i = 8 * KiB; i < 64 * KiB; i++)
+		assert_int_equal(0xAA, g_chip_state.buf[i]);
 }
 
 static size_t verify_chip_fread(void *state, void *buf, size_t size, size_t len, FILE *fp)

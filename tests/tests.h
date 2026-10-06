@@ -90,6 +90,10 @@ void write_chip_with_dummyflasher_test_success(void **state);
 void write_chip_feature_no_erase(void **state);
 void write_nonaligned_region_with_dummyflasher_test_success(void **state);
 void write_region_fold_larger_block_with_dummyflasher_test_success(void **state);
+void write_region_does_not_erase_outside_layout_test_success(void **state);
+void write_region_does_not_erase_outside_layout_verify_all_test_success(void **state);
+void write_adjacent_regions_fold_across_boundary_test_success(void **state);
+void write_region_non_uniform_eraseblocks_test_success(void **state);
 void verify_chip_test_success(void **state);
 void verify_chip_with_dummyflasher_test_success(void **state);
 

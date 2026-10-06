@@ -79,6 +79,12 @@ struct eraser {
  * The 'limit' field holds the number of blocks of this size, which is
  * equivalent to one block of the next larger size in term of time required
  * for erasing/programming.
+ *
+ * The 'in_layout' bit is set when the block lies entirely within the
+ * included layout regions (at the smallest block size: when the block
+ * intersects an included region, since reads are aligned to that size).
+ * Only blocks with this bit set may be folded into, so that an erase never
+ * extends beyond the regions the user asked to modify.
  */
 struct range_map {
 	size_t block_size;
@@ -86,6 +92,7 @@ struct range_map {
 	struct b_map {
 		uint8_t need_change:1;
 		uint8_t need_erase:1;
+		uint8_t in_layout:1;
 	} *block_map;
 };
 
@@ -284,22 +291,6 @@ static size_t fill_sorted_erasers(struct flashctx *flash,
 		j++;
         }
 
-	/*
-	 * When partial verification (!verify_whole_chip / -N) is used,
-	 * read_by_layout() only aligns partial reads up to the largest
-	 * sub-chip block size (e.g. 64 KiB), not the full chip size.
-	 * Drop any full-chip eraser from the top of sorted_erasers if
-	 * smaller block erasers are available, so fold_range_maps()
-	 * cannot upgrade into a full-chip erase that wipes unread areas.
-	 */
-	if (!flash->flags.verify_whole_chip && j > 1) {
-		size_t top_fn = sorted_erasers[j - 1].eraser_index;
-		size_t top_reg = sorted_erasers[j - 1].region_index;
-		if (chip.block_erasers[top_fn].eraseblocks[top_reg].size >=
-		    (size_t)chip.total_size * 1024)
-			j--;
-	}
-
 	if (j) {
 		msg_pdbg("%s: found %zd valid erasers\n", __func__, j);
 		return j;
@@ -406,11 +397,13 @@ static void fold_range_maps(struct range_map *maps,
 			int lower_index;
 			int erase_marked_blocks;
 			int change_marked_blocks;
+			int in_layout_blocks;
 
 			lower_start = block_index * block_mult;
 			lower_end = lower_start + block_mult;
 			erase_marked_blocks = 0;
 			change_marked_blocks = 0;
+			in_layout_blocks = 0;
 
 			for (lower_index = lower_start;
 			     lower_index < lower_end;
@@ -421,7 +414,19 @@ static void fold_range_maps(struct range_map *maps,
 
 				if (map[-1].block_map[lower_index].need_change)
 					change_marked_blocks++;
+
+				if (map[-1].block_map[lower_index].in_layout)
+					in_layout_blocks++;
 			}
+
+			/*
+			 * A larger block may only be used if it lies entirely
+			 * within the included layout regions; otherwise the
+			 * erase would extend beyond what the user asked for.
+			 */
+			if (in_layout_blocks != block_mult)
+				continue;
+			map->block_map[block_index].in_layout = 1;
 
 			/*
 			 * Mark larger block for erasing; if any of the
@@ -492,13 +497,15 @@ static void fold_range_maps(struct range_map *maps,
  * @chip_size		size of this chip in bytes
  * @num_sorted_erasers  size of the sorted_erasers array
  * @erased_value	value contained in all bytes of the erased flash
+ * @layout		layout whose included regions bound the erase
  */
 static void fill_action_descriptor(struct action_descriptor *descriptor,
 				   struct eraser *sorted_erasers,
 				   struct block_eraser* chip_erasers,
 				   size_t chip_size,
 				   size_t num_sorted_erasers,
-				   unsigned erased_value)
+				   unsigned erased_value,
+				   const struct flashrom_layout *layout)
 {
 	const uint8_t *newc;
 	const uint8_t *oldc;
@@ -581,6 +588,21 @@ static void fill_action_descriptor(struct action_descriptor *descriptor,
 	/* Now, let's fill up the map for the smallest bock size. */
 	block_size = range_maps[0].block_size;
 	block_map = range_maps[0].block_map;
+
+	/*
+	 * Mark the smallest blocks that intersect an included region. Reads
+	 * are aligned to at least this block size, so such a block has been
+	 * read in full and may be erased; blocks outside the layout must not.
+	 */
+	const struct romentry *entry = NULL;
+	while ((entry = layout_next_included(layout, entry))) {
+		size_t first = entry->region.start / block_size;
+		size_t last = entry->region.end / block_size;
+
+		for (i = first; i <= last && i < chip_size / block_size; i++)
+			block_map[i].in_layout = 1;
+	}
+
 	for (i = 0; i < chip_size; i++) {
 		int block_index;
 
@@ -718,7 +740,8 @@ struct action_descriptor *prepare_action_descriptor(struct flashctx *flash,
 
 	fill_action_descriptor(descriptor, sorted_erasers,
 			       flash->chip->block_erasers, chip_size,
-			       num_erasers, ERASED_VALUE(flash));
+			       num_erasers, ERASED_VALUE(flash),
+			       get_layout(flash));
 
 	dump_descriptor(descriptor);
 

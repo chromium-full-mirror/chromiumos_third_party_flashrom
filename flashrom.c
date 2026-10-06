@@ -1328,8 +1328,8 @@ notfound:
 /*
  * Gets the largest sub-chip erase granularity; it is used when
  * deciding if the layout map needs to be adjusted such that erase boundaries
- * match the largest block size that erase_and_write_flash() / fold_range_maps()
- * may upgrade to. Returns -1 if unsuccessful.
+ * match the largest block size that erase_and_write_flash() may use as its
+ * smallest erase granularity. Returns -1 if unsuccessful.
  */
 static int get_required_erase_size(struct flashctx *flash)
 {
@@ -1339,9 +1339,13 @@ static int get_required_erase_size(struct flashctx *flash)
 	bool has_full_chip_eraser = false;
 
 	/*
-	 * Find the largest sub-chip eraseable block size for read alignment,
-	 * because action_descriptor's fold_range_maps() (70% rule) may promote
-	 * smaller block erases up to the largest sub-chip block size (e.g. 64 KiB).
+	 * Find the largest sub-chip eraseable block size for read alignment.
+	 * action_descriptor erases any block of its smallest granularity that
+	 * intersects an included region, and that granularity is not always
+	 * the smallest eraseblock: fill_sorted_erasers() picks one eraseblock
+	 * size per eraser, so on chips with non-uniform eraseblocks it can be
+	 * e.g. 64 KiB even though a 4 KiB eraseblock exists. Aligning reads to
+	 * the largest sub-chip block keeps such blocks fully read.
 	 * Full-chip erasers are skipped. An eraseblock larger than the chip is
 	 * a broken chip definition; selfcheck() only covers flashchips[], not
 	 * chips built at runtime (SFDP, linux_mtd, cros_ec), so reject it here.
