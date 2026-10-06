@@ -437,6 +437,38 @@ pub fn bios_info() -> IoResult<String> {
     Err(std::io::ErrorKind::NotFound.into())
 }
 
+fn parse_spi_nor_dir(dir: &Path) -> Option<String> {
+    let vendor = read_sysfs_attr(dir, "manufacturer");
+    let name = read_sysfs_attr(dir, "partname");
+    let jedec = read_sysfs_attr(dir, "jedec_id");
+
+    if vendor.is_none() && name.is_none() && jedec.is_none() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if let Some(v) = vendor {
+        parts.push(format!("vendor=\"{}\"", v));
+    }
+    if let Some(n) = name {
+        parts.push(format!("name=\"{}\"", n));
+    }
+    if let Some(j) = jedec {
+        parts.push(format!("jedec_id=\"{}\"", j));
+    }
+
+    Some(format!("spi-nor: {}", parts.join(" ")))
+}
+
+fn spi_nor_chip_info_at(sysfs_root: &Path) -> Option<String> {
+    parse_spi_nor_dir(&sysfs_root.join("class/mtd/mtd0/device/spi-nor"))
+}
+
+/// Reads SPI-NOR chip attributes for the default `linux_mtd` device (`mtd0`).
+pub fn spi_nor_chip_info() -> Option<String> {
+    spi_nor_chip_info_at(Path::new("/sys"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +687,59 @@ mod tests {
         assert_eq!(
             corsola_info,
             "BIOS Information\n\tRO FWID: Google_Corsola.15194.0.0\n\tRW FWID: Google_Corsola.15194.1.0"
+        );
+    }
+
+    #[test]
+    fn test_parse_spi_nor_dir() {
+        let temp_dir = TempDir::new("spi_nor");
+        assert_eq!(parse_spi_nor_dir(temp_dir.path()), None);
+
+        File::create(temp_dir.path().join("manufacturer"))
+            .unwrap()
+            .write_all(b"winbond\n")
+            .unwrap();
+        File::create(temp_dir.path().join("partname"))
+            .unwrap()
+            .write_all(b"w25q256jw\n")
+            .unwrap();
+        File::create(temp_dir.path().join("jedec_id"))
+            .unwrap()
+            .write_all(b"ef6019\n")
+            .unwrap();
+
+        let info = parse_spi_nor_dir(temp_dir.path()).unwrap();
+        assert_eq!(
+            info,
+            "spi-nor: vendor=\"winbond\" name=\"w25q256jw\" jedec_id=\"ef6019\""
+        );
+    }
+
+    #[test]
+    fn test_spi_nor_chip_info_at_only_reads_mtd0() {
+        let temp_dir = TempDir::new("mtd0");
+
+        // 1. Unrelated bus/spi/devices/spi0.0/spi-nor should not be read
+        let other_spi = temp_dir.path().join("bus/spi/devices/spi0.0/spi-nor");
+        fs::create_dir_all(&other_spi).unwrap();
+        File::create(other_spi.join("partname"))
+            .unwrap()
+            .write_all(b"other_chip\n")
+            .unwrap();
+
+        assert_eq!(spi_nor_chip_info_at(temp_dir.path()), None);
+
+        // 2. Populating class/mtd/mtd0/device/spi-nor returns the chip info
+        let mtd0_spi = temp_dir.path().join("class/mtd/mtd0/device/spi-nor");
+        fs::create_dir_all(&mtd0_spi).unwrap();
+        File::create(mtd0_spi.join("partname"))
+            .unwrap()
+            .write_all(b"w25q256jw\n")
+            .unwrap();
+
+        assert_eq!(
+            spi_nor_chip_info_at(temp_dir.path()),
+            Some("spi-nor: name=\"w25q256jw\"".to_string())
         );
     }
 }

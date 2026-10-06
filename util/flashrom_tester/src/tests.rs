@@ -51,6 +51,10 @@ use std::sync::atomic::AtomicBool;
 const ELOG_FILE: &str = "/tmp/elog.file";
 const FW_MAIN_B_PATH: &str = "/tmp/FW_MAIN_B.bin";
 
+// Identity reported by opaque programmers; see flashchips.c "Opaque flash chip" entry.
+const OPAQUE_CHIP_VENDOR: &str = "Programmer";
+const OPAQUE_CHIP_NAME: &str = "Opaque flash chip";
+
 /// Iterate over tests, yielding only those tests with names matching filter_names.
 ///
 /// If filter_names is None, all tests will be run. None is distinct from Some(∅);
@@ -117,10 +121,18 @@ pub fn generic<'a, TN: Iterator<Item = &'a str>>(
         test_names.map(|names| names.map(|s| s.to_lowercase()).collect());
     let tests = filter_tests(tests, &mut filter_names);
 
-    let chip_name = cmd
-        .name()
-        .map(|x| format!("vendor=\"{}\" name=\"{}\"", x.0, x.1))
-        .unwrap_or("<Unknown chip>".into());
+    let chip_name = match cmd.name() {
+        Ok((vendor, name)) => {
+            let mut s = format!("vendor=\"{}\" name=\"{}\"", vendor, name);
+            if vendor == OPAQUE_CHIP_VENDOR && name == OPAQUE_CHIP_NAME {
+                if let Some(spi_info) = cros_sysinfo::spi_nor_chip_info() {
+                    s.push_str(&format!(" ({})", spi_info));
+                }
+            }
+            s
+        }
+        Err(_) => "<Unknown chip>".into(),
+    };
 
     // ------------------------.
     // Run all the tests and collate the findings:
