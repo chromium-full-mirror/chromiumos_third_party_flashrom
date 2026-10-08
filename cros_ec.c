@@ -1002,8 +1002,8 @@ static int cros_ec_probe_size(struct flashctx *flash)
 		eraser->eraseblocks[0].count = info.flash_size /
 			eraser->eraseblocks[0].size;
 	} else {
-		struct ec_response_flash_info_2 info_2;
-		struct ec_params_flash_info_2 params_2;
+		struct ec_response_flash_info_2 info_2 = {0};
+		struct ec_params_flash_info_2 params_2 = {0};
 		struct ec_response_flash_info_2 *info_2_p = &info_2;
 		int size_info_v2 = sizeof(info_2), i;
 
@@ -1032,16 +1032,23 @@ static int cros_ec_probe_size(struct flashctx *flash)
 			size_info_v2 += info_2_p->num_banks_total *
 				sizeof(struct ec_flash_bank);
 
-			info_2_p = malloc(size_info_v2);
+			info_2_p = calloc(1, size_info_v2);
 			if (!info_2_p) {
-				msg_perr("%s(): malloc of %d banks failed\n",
+				msg_perr("%s(): calloc of %d banks failed\n",
 					 __func__, params_2.num_banks_desc);
 				return 0;
 			}
 		}
 		flash->chip->total_size = info_2_p->flash_size / 1024;
+		if (info_2_p->num_banks_desc > params_2.num_banks_desc)
+			info_2_p->num_banks_desc = params_2.num_banks_desc;
+		if (info_2_p->num_banks_desc > NUM_ERASEREGIONS) {
+			msg_pwarn("%s(): EC reports %u banks, clamping to %d\n",
+				  __func__, info_2_p->num_banks_desc,
+				  NUM_ERASEREGIONS);
+			info_2_p->num_banks_desc = NUM_ERASEREGIONS;
+		}
 		for (i = 0; i < info_2_p->num_banks_desc; i++) {
-			/* Allow overriding the erase block size in case EC is incorrect */
 			eraser->eraseblocks[i].size =
 				 (unsigned) 1 << info_2_p->banks[i].erase_size_exp;
 			eraser->eraseblocks[i].count =
