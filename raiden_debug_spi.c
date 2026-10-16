@@ -343,6 +343,7 @@
 #include "usb_device.h"
 
 #include <libusb.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -443,6 +444,7 @@ struct raiden_debug_spi_data {
 	uint8_t in_ep;
 	uint8_t out_ep;
 	uint8_t protocol_version;
+	bool drain;
 	/*
 	 * Note: Due to bugs, flashrom does not always treat the max_data_write
 	 * and max_data_read counts as the maximum packet size. As a result, we
@@ -695,16 +697,75 @@ static void fill_usb_packet(struct usb_spi_packet_ctx *dst,
 }
 
 /*
+ * Check if the USB device is attached via the Linux USB/IP virtual host
+ * controller (vhci_hcd), commonly used for remote USB forwarding like Pontis.
+ * Speculative bulk transfers with short timeouts on vhci_hcd cause URB unlinks
+ * that can poison remote WebUSB / USBIP pipes.
+ */
+static bool is_vhci_device(const struct usb_device *dev)
+{
+#if defined(__linux__)
+	if (!dev || !dev->device)
+		return false;
+
+	uint8_t bus = libusb_get_bus_number(dev->device);
+	char syspath[64];
+	char target[PATH_MAX];
+
+	snprintf(syspath, sizeof(syspath), "/sys/bus/usb/devices/usb%u", bus);
+	if (realpath(syspath, target)) {
+		if (strstr(target, "vhci_hcd"))
+			return true;
+	}
+#endif
+	return false;
+}
+
+static int should_drain_interface(const struct programmer_cfg *cfg,
+				  const struct usb_device *dev, bool *drain)
+{
+	char *drain_str = extract_programmer_param_str(cfg, "drain");
+	if (drain_str) {
+		int ret = 0;
+		if (!strcasecmp(drain_str, "true")) {
+			*drain = true;
+		} else if (!strcasecmp(drain_str, "false")) {
+			*drain = false;
+		} else {
+			msg_perr("Raiden: Invalid drain parameter: '%s'\n", drain_str);
+			ret = 1;
+		}
+		free(drain_str);
+		return ret;
+	}
+
+	if (is_vhci_device(dev)) {
+		msg_pdbg("Raiden: Virtual/remote USB host (vhci_hcd) detected; bypassing bulk IN drain\n");
+		*drain = false;
+		return 0;
+	}
+
+	*drain = true;
+	return 0;
+}
+
+/*
  * Read data possibly pending on the target before starting the session.
  *
  * @param dev       USB Device with open connection to the target
  * @param in_ep     Data In endpoint of the device.
+ * @param drain     Whether draining is enabled.
  */
-static void drain_usb_interface(const struct usb_device *dev, uint8_t in_ep)
+static void drain_usb_interface(const struct usb_device *dev, uint8_t in_ep, bool drain)
 {
 	uint8_t drain_buf[USB_MAX_PACKET_SIZE];
 	int received;
 	int max_packets = 100; /* There should never be this many. */
+
+	if (!drain) {
+		msg_pdbg("Raiden: Bulk IN drain disabled, skipping\n");
+		return;
+	}
 
 	/* Keep reading until there is no more data. */
 	while (libusb_bulk_transfer(dev->handle,
@@ -957,7 +1018,7 @@ static int send_command_v1(const struct flashctx *flash,
 			}
 			msg_pdbg("Raiden: Clearing IN halt and draining interface on read retry\n");
 			libusb_clear_halt(ctx_data->dev->handle, ctx_data->in_ep);
-			drain_usb_interface(ctx_data->dev, ctx_data->in_ep);
+			drain_usb_interface(ctx_data->dev, ctx_data->in_ep, ctx_data->drain);
 			default_delay(RETRY_INTERVAL_US);
 		}
 	}
@@ -1309,7 +1370,7 @@ static int send_command_v2(const struct flashctx *flash,
 				}
 				msg_pdbg("Raiden: Clearing IN halt and draining interface on read retry\n");
 				libusb_clear_halt(ctx_data->dev->handle, ctx_data->in_ep);
-				drain_usb_interface(ctx_data->dev, ctx_data->in_ep);
+				drain_usb_interface(ctx_data->dev, ctx_data->in_ep, ctx_data->drain);
 
 				/* Ensure OUT endpoint is clean before sending restart command. */
 				libusb_clear_halt(ctx_data->dev->handle, ctx_data->out_ep);
@@ -1670,6 +1731,11 @@ loop_end:
 
 	free_dev_list(&current);
 
+	bool drain = true;
+	ret = should_drain_interface(cfg, device, &drain);
+	if (ret != 0)
+		goto out_free_dev;
+
 	ret = LIBUSB(libusb_control_transfer(
 				device->handle,
 				LIBUSB_ENDPOINT_OUT |
@@ -1691,7 +1757,7 @@ loop_end:
 	 * be still sitting in the device USB output buffer. Drain it before
 	 * starting the new session.
 	 */
-	drain_usb_interface(device, in_endpoint);
+	drain_usb_interface(device, in_endpoint, drain);
 
 	/*
 	 * Allow for power to settle on the AP and EC flash devices.
@@ -1699,6 +1765,7 @@ loop_end:
 	 * can require up to 10 ms from power on to the first write.
 	 */
 	if ((request_enable == RAIDEN_DEBUG_SPI_REQ_ENABLE_AP) ||
+		(request_enable == RAIDEN_DEBUG_SPI_REQ_ENABLE_AP_CUSTOM) ||
 		(request_enable == RAIDEN_DEBUG_SPI_REQ_ENABLE_EC))
 		usleep(50 * 1000);
 
@@ -1721,6 +1788,7 @@ loop_end:
 	data->in_ep = in_endpoint;
 	data->out_ep = out_endpoint;
 	data->spi_config = spi_config;
+	data->drain = drain;
 
 	/*
 	 * The SPI master needs to be configured based on the device connected.

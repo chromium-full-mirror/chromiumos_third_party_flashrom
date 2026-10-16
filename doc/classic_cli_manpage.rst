@@ -981,6 +981,12 @@ and ``custom_rst=true`` set ``RAIDEN_DEBUG_SPI_REQ_ENABLE_AP_CUSTOM`` instead of
 This custom reset will modify the timeout from 3ms to 10ms and will not set ``EC_RST_L``, meaning neither the EC nor the AP will be reset. With this setting, it's the user's responsibility to manage the reset signal manually or by configuring the GPIO.
 Failure to handle the reset signal appropriately will likely result in flashing errors.
 
+The optional ``drain`` parameter controls whether to drain residual packets from the USB IN endpoint on session start and retry::
+
+        flashrom -p raiden_debug_spi:drain=<true|false>
+
+syntax, where draining is enabled by default on physical USB controllers to flush leftover data from interrupted sessions, but automatically disabled when a remote/virtual USB host (e.g. ``vhci_hcd`` / USBIP / Pontis WebUSB) is detected. On virtual USB hosts, speculative reads with short timeouts can cancel in-flight URBs and break communication.
+
 More information about the ChromiumOS servo
 hardware is available at `servos website <https://chromium.googlesource.com/chromiumos/third_party/hdctools/+/HEAD/docs/servo_v4.md>`_.
 
